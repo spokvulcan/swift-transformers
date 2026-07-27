@@ -124,6 +124,22 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
 
+    /// Lazy, build-once byte-keyed tables (derived 1:1 from `bpeRanks` /
+    /// `tokensToIds` on first `bpe`/`convertTokenToId` call; class reference,
+    /// so the unlocked fast-path read below is a single-pointer load).
+    private let byteTablesLock = NSLock()
+    private var byteTablesCache: BytePairTables?
+
+    private func byteTables() -> BytePairTables {
+        if let cached = byteTablesCache { return cached }
+        byteTablesLock.lock()
+        defer { byteTablesLock.unlock() }
+        if let cached = byteTablesCache { return cached }
+        let built = BytePairTables(bpeRanks: bpeRanks, tokensToIds: tokensToIds)
+        byteTablesCache = built
+        return built
+    }
+
     static func mergesFromConfig(_ config: Config?) -> [[String]]? {
         guard let config else { return nil }
 
@@ -194,7 +210,9 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Parameter token: The token string to convert
     /// - Returns: The numeric ID, or the unknown token ID if not found
     func convertTokenToId(_ token: String) -> Int? {
-        tokensToIds[token as NSString] ?? unknownTokenId
+        // Byte-keyed lookup over the exact contents of `tokensToIds`; same
+        // result as the NSString-bridged subscript, without bridging.
+        byteTables().id(for: token) ?? unknownTokenId
     }
 
     /// Converts a numeric token ID back to its string representation.
@@ -232,23 +250,38 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     }
 
     /// Applies the BPE merge sequence to `token` and returns the resulting pieces.
-    ///
-    /// Equivalent to the canonical greedy "lowest-rank merge first" BPE algorithm
-    /// (e.g. `tiktoken`, `huggingface/tokenizers`). Maintains the symbols as an
-    /// in-place linked list and tracks candidate merges in a min-heap keyed by
-    /// rank, so the work per merge step is O(log N) heap ops + O(1) list surgery.
-    ///
-    /// Returns an array of pieces rather than a space-joined string: a downstream
-    /// `split(separator: " ")` would be unsafe when a piece begins with a Unicode
-    /// non-spacing mark, because the mark forms a single grapheme cluster with the
-    /// preceding space and the split silently swallows the boundary.
     func bpe(token: String) -> [String] {
-        var symbols = token.unicodeScalars.map { String($0) }
-        if symbols.count <= 1 {
-            return symbols.isEmpty ? [] : [token]
+        bpeByteNative(token: token)
+    }
+
+    /// Byte-native implementation: the SAME algorithm with the SAME
+    /// merge order — initial symbols are one per Unicode scalar (byte ranges
+    /// into a single UTF-8 buffer instead of one allocated String per
+    /// scalar), merges extend a byte range instead of concatenating Strings,
+    /// and rank lookups run against the byte-keyed `BytePairTables` (identical
+    /// contents to `bpeRanks`, including the `(rank, left)` heap tie-break
+    /// and the stale-entry re-check).
+    private func bpeByteNative(token: String) -> [String] {
+        let tables = byteTables()
+        let buf = Array(token.utf8)
+
+        // Initial symbol ranges: one per Unicode scalar — the same boundaries
+        // as `token.unicodeScalars.map { String($0) }`.
+        var ranges: [(start: Int, end: Int)] = []
+        ranges.reserveCapacity(buf.count / 2 + 2)
+        var idx = 0
+        while idx < buf.count {
+            let b0 = buf[idx]
+            let len = b0 < 0x80 ? 1 : (b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4))
+            ranges.append((idx, idx + len))
+            idx += len
         }
 
-        let initialCount = symbols.count
+        let initialCount = ranges.count
+        if initialCount <= 1 {
+            return initialCount == 0 ? [] : [token]
+        }
+
         var prevIndex = Array(repeating: -1, count: initialCount)
         var nextIndex = Array(repeating: -1, count: initialCount)
         var alive = Array(repeating: true, count: initialCount)
@@ -257,18 +290,20 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             nextIndex[i] = (i == initialCount - 1) ? -1 : i + 1
         }
 
-        // Min-heap of merge candidates. We never remove entries on merge;
-        // instead, when an entry is popped we re-check that the pair at
-        // `(left, next[left])` is still the same and still has the recorded
-        // rank — stale entries are simply skipped (lazy deletion).
+        // Rank of the merge pair (ranges[i], ranges[j]); ranges are always
+        // contiguous, so the pair key is buf[aStart..<bEnd] split at aEnd.
+        @inline(__always)
+        func pairRank(_ i: Int, _ j: Int) -> Int? {
+            tables.rank(in: buf, aStart: ranges[i].start, aEnd: ranges[i].end, bEnd: ranges[j].end)
+        }
+
         var heap = MinHeap<BPEMergeCandidate>()
         heap.reserveCapacity(initialCount)
 
-        // Enqueue the candidate merge at position `left -> next[left]`, if any.
         func enqueue(left: Int) {
             let right = nextIndex[left]
             guard right != -1, alive[left], alive[right] else { return }
-            if let rank = bpeRanks[BytePair(symbols[left], symbols[right])] {
+            if let rank = pairRank(left, right) {
                 heap.push(BPEMergeCandidate(rank: rank, left: left))
             }
         }
@@ -283,37 +318,32 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             let j = nextIndex[i]
             guard j != -1, alive[j] else { continue }
             // Validate the entry is not stale: the pair at (i, j) must still
-            // have exactly the rank we recorded when we enqueued it.
-            guard let actualRank = bpeRanks[BytePair(symbols[i], symbols[j])], actualRank == top.rank else {
+            // have exactly the rank recorded when it was enqueued.
+            guard let actualRank = pairRank(i, j), actualRank == top.rank else {
                 continue
             }
 
-            // Absorb symbol j into symbol i.
-            symbols[i] = symbols[i] + symbols[j]
+            // Absorb symbol j into symbol i (byte-range extension; identical
+            // to `symbols[i] = symbols[i] + symbols[j]`).
+            ranges[i].end = ranges[j].end
             let k = nextIndex[j]
             nextIndex[i] = k
             if k != -1 { prevIndex[k] = i }
             alive[j] = false
 
-            // The merge invalidates the pairs (prev, i) and (j, k); the new
-            // candidates to consider are (prev, i) (now spanning the merged
-            // text on the right) and (i, k) (now spanning the merged text on
-            // the left). Stale entries left over for the old pairs in the
-            // heap will be discarded when popped.
             if prevIndex[i] != -1 {
                 enqueue(left: prevIndex[i])
             }
             enqueue(left: i)
         }
 
-        // Walk the surviving symbols from the head (index 0 is never absorbed:
-        // merges always move text from `next` into `current`, so position 0
-        // remains alive throughout).
+        // Walk the surviving ranges from the head (position 0 is never
+        // absorbed: merges always move bytes from `next` into `current`).
         var pieces: [String] = []
         pieces.reserveCapacity(initialCount)
         var cursor = 0
         while cursor != -1 {
-            pieces.append(symbols[cursor])
+            pieces.append(String(decoding: buf[ranges[cursor].start..<ranges[cursor].end], as: UTF8.self))
             cursor = nextIndex[cursor]
         }
         return pieces
@@ -337,3 +367,162 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
         return tokens
     }
 }
+
+
+/// Byte-keyed lookup tables derived 1:1 from `bpeRanks` and `tokensToIds`:
+/// merge-pair UTF-8 bytes (+ split point) -> merge rank, and token UTF-8
+/// bytes -> token id. Open addressing with linear probing; lookups hash raw
+/// UTF-8 bytes (FNV-1a) instead of Swift String keys, so no String hashing
+/// (NFC walk), no NSString bridging, and no per-lookup allocation. Keys are
+/// verified with a full byte comparison, so results are exactly those of the
+/// String-keyed tables (NSString keys compare byte-exactly, as does this
+/// table — including any canonically-equal-but-differently-encoded keys that
+/// `BinaryDistinctString` admits).
+private final class BytePairTables {
+    private struct PairEntry {
+        var hash: UInt64
+        var blobOffset: Int32
+        var lenA: Int32
+        var lenB: Int32
+        var rank: Int32
+    }
+
+    private struct IdEntry {
+        var hash: UInt64
+        var blobOffset: Int32
+        var len: Int32
+        var id: Int32
+    }
+
+    private let pairBlob: [UInt8]
+    private let pairEntries: [PairEntry]
+    private let pairSlots: [Int32]  // entry index + 1; 0 = empty
+    private let pairMask: Int
+
+    private let idBlob: [UInt8]
+    private let idEntries: [IdEntry]
+    private let idSlots: [Int32]
+    private let idMask: Int
+
+    @inline(__always) private static func fnvContinue(_ h: UInt64, _ b: UInt8) -> UInt64 {
+        (h ^ UInt64(b)) &* 0x0000_0100_0000_01B3
+    }
+
+    init(bpeRanks: [BytePair: Int], tokensToIds: [NSString: Int]) {
+        var blob: [UInt8] = []
+        var entries: [PairEntry] = []
+        entries.reserveCapacity(bpeRanks.count)
+        blob.reserveCapacity(bpeRanks.count * 8)
+        for (pair, rank) in bpeRanks {
+            let offset = blob.count
+            var h: UInt64 = 0xCBF2_9CE4_8422_2325
+            for b in pair.a.utf8 { h = BytePairTables.fnvContinue(h, b) }
+            for b in pair.b.utf8 { h = BytePairTables.fnvContinue(h, b) }
+            h = BytePairTables.fnvContinue(h, UInt8(truncatingIfNeeded: pair.a.utf8.count))
+            h = BytePairTables.fnvContinue(h, UInt8(truncatingIfNeeded: pair.a.utf8.count >> 8))
+            blob.append(contentsOf: pair.a.utf8)
+            blob.append(contentsOf: pair.b.utf8)
+            entries.append(PairEntry(
+                hash: h,
+                blobOffset: Int32(offset),
+                lenA: Int32(pair.a.utf8.count),
+                lenB: Int32(pair.b.utf8.count),
+                rank: Int32(rank)))
+        }
+        pairBlob = blob
+        pairEntries = entries
+        (pairSlots, pairMask) = BytePairTables.buildSlots(hashes: entries.map { $0.hash })
+
+        var iblob: [UInt8] = []
+        var ientries: [IdEntry] = []
+        ientries.reserveCapacity(tokensToIds.count)
+        iblob.reserveCapacity(tokensToIds.count * 6)
+        for (key, id) in tokensToIds {
+            let str = key as String
+            let offset = iblob.count
+            var h: UInt64 = 0xCBF2_9CE4_8422_2325
+            for b in str.utf8 { h = BytePairTables.fnvContinue(h, b) }
+            h = BytePairTables.fnvContinue(h, 0)
+            h = BytePairTables.fnvContinue(h, 0)
+            iblob.append(contentsOf: str.utf8)
+            ientries.append(IdEntry(
+                hash: h,
+                blobOffset: Int32(offset),
+                len: Int32(str.utf8.count),
+                id: Int32(id)))
+        }
+        idBlob = iblob
+        idEntries = ientries
+        (idSlots, idMask) = BytePairTables.buildSlots(hashes: ientries.map { $0.hash })
+    }
+
+    private static func buildSlots(hashes: [UInt64]) -> ([Int32], Int) {
+        var size = 16
+        while size < hashes.count * 2 { size *= 2 }
+        var slots = [Int32](repeating: 0, count: size)
+        let mask = size - 1
+        for (i, h) in hashes.enumerated() {
+            var slot = Int(h & UInt64(mask))
+            while slots[slot] != 0 { slot = (slot + 1) & mask }
+            slots[slot] = Int32(i + 1)
+        }
+        return (slots, mask)
+    }
+
+    @inline(__always)
+    private static func bytesEqual(_ a: [UInt8], _ aOff: Int, _ b: [UInt8], _ bOff: Int, _ n: Int) -> Bool {
+        for i in 0 ..< n where a[aOff + i] != b[bOff + i] { return false }
+        return true
+    }
+
+    /// Rank of the merge pair whose left part is buf[aStart..<aEnd] and right
+    /// part is buf[aEnd..<bEnd]; nil if the pair has no merge.
+    func rank(in buf: [UInt8], aStart: Int, aEnd: Int, bEnd: Int) -> Int? {
+        let lenA = aEnd - aStart
+        let lenB = bEnd - aEnd
+        var h: UInt64 = 0xCBF2_9CE4_8422_2325
+        var i = aStart
+        while i < aEnd { h = BytePairTables.fnvContinue(h, buf[i]); i += 1 }
+        while i < bEnd { h = BytePairTables.fnvContinue(h, buf[i]); i += 1 }
+        h = BytePairTables.fnvContinue(h, UInt8(truncatingIfNeeded: lenA))
+        h = BytePairTables.fnvContinue(h, UInt8(truncatingIfNeeded: lenA >> 8))
+        var slot = Int(h & UInt64(pairMask))
+        while true {
+            let s = pairSlots[slot]
+            if s == 0 { return nil }
+            let e = pairEntries[Int(s) - 1]
+            if e.hash == h, Int(e.lenA) == lenA, Int(e.lenB) == lenB,
+                BytePairTables.bytesEqual(pairBlob, Int(e.blobOffset), buf, aStart, lenA + lenB)
+            {
+                return Int(e.rank)
+            }
+            slot = (slot + 1) & pairMask
+        }
+    }
+
+    /// Id of the token with exactly these UTF-8 bytes; nil if not in vocab.
+    func id(for token: String) -> Int? {
+        let utf8 = token.utf8
+        var h: UInt64 = 0xCBF2_9CE4_8422_2325
+        for b in utf8 { h = BytePairTables.fnvContinue(h, b) }
+        h = BytePairTables.fnvContinue(h, 0)
+        h = BytePairTables.fnvContinue(h, 0)
+        var slot = Int(h & UInt64(idMask))
+        while true {
+            let s = idSlots[slot]
+            if s == 0 { return nil }
+            let e = idEntries[Int(s) - 1]
+            if e.hash == h, Int(e.len) == utf8.count {
+                var matched = true
+                var i = Int(e.blobOffset)
+                for b in utf8 {
+                    if idBlob[i] != b { matched = false; break }
+                    i += 1
+                }
+                if matched { return Int(e.id) }
+            }
+            slot = (slot + 1) & idMask
+        }
+    }
+}
+
