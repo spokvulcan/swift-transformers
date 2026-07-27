@@ -392,6 +392,29 @@ public protocol Tokenizer: Sendable {
         tools: [ToolSpec]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int]
+
+    /// Renders the chat template to text without tokenizing — the render half
+    /// of `applyChatTemplate`, exposed so callers can split render from encode
+    /// (e.g. to tokenize only a verified suffix of a previously rendered
+    /// prompt). `applyChatTemplate` must produce exactly
+    /// `encode(text: renderChatTemplate(...), addSpecialTokens: false)` modulo
+    /// its truncation/maxLength handling.
+    ///
+    /// - Parameters:
+    ///   - messages: Array of message dictionaries representing the conversation
+    ///   - chatTemplate: Optional chat template specification
+    ///   - addGenerationPrompt: Whether to add a generation prompt for the assistant
+    ///   - tools: Optional array of tool specifications for function calling
+    ///   - additionalContext: Additional context variables for template rendering
+    /// - Returns: The rendered chat template text
+    /// - Throws: `TokenizerError` if template application fails or no template is available
+    func renderChatTemplate(
+        messages: [Message],
+        chatTemplate: ChatTemplateArgument?,
+        addGenerationPrompt: Bool,
+        tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> String
 }
 
 extension Tokenizer {
@@ -416,6 +439,34 @@ extension Tokenizer {
         } else {
             throw TokenizerError.chatTemplate("Not implemented")
         }
+    }
+
+    /// Default implementation for conformers that do not support render-only
+    /// access: behave as if no chat template were available, matching the
+    /// failure mode of `applyChatTemplate` on such tokenizers. Public so
+    /// third-party conformers outside this module keep compiling without
+    /// implementing the new requirement.
+    public func renderChatTemplate(
+        messages: [Message],
+        chatTemplate: ChatTemplateArgument?,
+        addGenerationPrompt: Bool,
+        tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> String {
+        throw TokenizerError.missingChatTemplate
+    }
+
+    /// Convenience matching `applyChatTemplate(messages:tools:additionalContext:)`:
+    /// renders with the configured template and `addGenerationPrompt: true`.
+    public func renderChatTemplate(
+        messages: [Message],
+        tools: [ToolSpec]? = nil,
+        additionalContext: [String: any Sendable]? = nil
+    ) throws -> String {
+        try renderChatTemplate(
+            messages: messages, chatTemplate: nil, addGenerationPrompt: true,
+            tools: tools, additionalContext: additionalContext
+        )
     }
 }
 
@@ -736,20 +787,17 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         )
     }
 
-    public func applyChatTemplate(
+    /// Renders the chat template to text without tokenizing. This is the
+    /// render half of `applyChatTemplate(messages:chatTemplate:addGenerationPrompt:truncation:maxLength:tools:additionalContext:)`,
+    /// which encodes exactly this method's output with
+    /// `addSpecialTokens: false` (then applies truncation/maxLength).
+    public func renderChatTemplate(
         messages: [Message],
         chatTemplate: ChatTemplateArgument? = nil,
         addGenerationPrompt: Bool = false,
-        truncation: Bool = false,
-        maxLength: Int? = nil,
-        // A list of tools (callable functions) that will be accessible to the model. If the template does not
-        // support function calling, this argument will have no effect. Each tool should be passed as a JSON Schema,
-        // giving the name, description and argument types for the tool. See the
-        // [chat templating guide](https://huggingface.co/docs/transformers/main/en/chat_templating#automated-function-conversion-for-tool-use)
-        // for more information.
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
-    ) throws -> [Int] {
+    ) throws -> String {
         var selectedChatTemplate: String?
         if let chatTemplate, case let .literal(template) = chatTemplate {
             // Use chat template from argument
@@ -822,7 +870,30 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             }
         }
 
-        let rendered = try template.render(context)
+        return try template.render(context)
+    }
+
+    public func applyChatTemplate(
+        messages: [Message],
+        chatTemplate: ChatTemplateArgument? = nil,
+        addGenerationPrompt: Bool = false,
+        truncation: Bool = false,
+        maxLength: Int? = nil,
+        // A list of tools (callable functions) that will be accessible to the model. If the template does not
+        // support function calling, this argument will have no effect. Each tool should be passed as a JSON Schema,
+        // giving the name, description and argument types for the tool. See the
+        // [chat templating guide](https://huggingface.co/docs/transformers/main/en/chat_templating#automated-function-conversion-for-tool-use)
+        // for more information.
+        tools: [ToolSpec]? = nil,
+        additionalContext: [String: any Sendable]? = nil
+    ) throws -> [Int] {
+        let rendered = try renderChatTemplate(
+            messages: messages,
+            chatTemplate: chatTemplate,
+            addGenerationPrompt: addGenerationPrompt,
+            tools: tools,
+            additionalContext: additionalContext
+        )
         var encodedTokens = encode(text: rendered, addSpecialTokens: false)
         var maxLength = maxLength ?? encodedTokens.count
         maxLength = min(maxLength, tokenizerConfig.modelMaxLength.integer() ?? maxLength)
