@@ -124,21 +124,19 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
 
-    /// Lazy, build-once byte-keyed tables (derived 1:1 from `bpeRanks` /
-    /// `tokensToIds` on first `bpe`/`convertTokenToId` call; class reference,
-    /// so the unlocked fast-path read below is a single-pointer load).
-    private let byteTablesLock = NSLock()
-    private var byteTablesCache: BytePairTables?
-
-    private func byteTables() -> BytePairTables {
-        if let cached = byteTablesCache { return cached }
-        byteTablesLock.lock()
-        defer { byteTablesLock.unlock() }
-        if let cached = byteTablesCache { return cached }
-        let built = BytePairTables(bpeRanks: bpeRanks, tokensToIds: tokensToIds)
-        byteTablesCache = built
-        return built
-    }
+    /// Byte-keyed lookup tables, derived 1:1 from `bpeRanks` / `tokensToIds`.
+    ///
+    /// Built eagerly in `init` and held in a `let`, NOT lazily behind a
+    /// double-checked lock. `BPETokenizer` is `@unchecked Sendable` and shared
+    /// across the callers of `encode`, and an unsynchronized fast-path read of
+    /// a lazily-assigned `var` has no acquire semantics: on a weakly-ordered
+    /// machine (every Apple Silicon target) a reader can observe the published
+    /// object pointer before the eight array buffers it points at are visible.
+    /// Both source dictionaries are `let`s fully populated by the end of
+    /// `init`, so there is nothing to defer — and the table build is
+    /// per-tokenizer-load, which C23 measured as fully hidden behind the weight
+    /// load (`async let`).
+    private let byteTables: BytePairTables
 
     static func mergesFromConfig(_ config: Config?) -> [[String]]? {
         guard let config else { return nil }
@@ -203,6 +201,10 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
         bosTokenId = bosToken == nil ? nil : tokensToIds[bosToken! as NSString]
 
         fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: false)
+
+        // Both source dictionaries are complete: derive the byte-keyed tables
+        // now so the hot paths read an immutable `let`.
+        byteTables = BytePairTables(bpeRanks: bpeRanks, tokensToIds: tokensToIds)
     }
 
     /// Converts a token string to its corresponding numeric ID.
@@ -212,7 +214,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     func convertTokenToId(_ token: String) -> Int? {
         // Byte-keyed lookup over the exact contents of `tokensToIds`; same
         // result as the NSString-bridged subscript, without bridging.
-        byteTables().id(for: token) ?? unknownTokenId
+        byteTables.id(for: token) ?? unknownTokenId
     }
 
     /// Converts a numeric token ID back to its string representation.
@@ -262,19 +264,24 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// contents to `bpeRanks`, including the `(rank, left)` heap tie-break
     /// and the stale-entry re-check).
     private func bpeByteNative(token: String) -> [String] {
-        let tables = byteTables()
+        let tables = byteTables
         let buf = Array(token.utf8)
 
         // Initial symbol ranges: one per Unicode scalar — the same boundaries
-        // as `token.unicodeScalars.map { String($0) }`.
+        // as `token.unicodeScalars.map { String($0) }`. `buf` comes from
+        // `String.utf8`, so it is always well-formed and the leading-byte width
+        // never runs past the end; the `min` keeps a malformed buffer (a
+        // continuation byte read as a lead, say) inside bounds rather than
+        // trapping on the slice below.
         var ranges: [(start: Int, end: Int)] = []
         ranges.reserveCapacity(buf.count / 2 + 2)
         var idx = 0
         while idx < buf.count {
             let b0 = buf[idx]
-            let len = b0 < 0x80 ? 1 : (b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4))
-            ranges.append((idx, idx + len))
-            idx += len
+            let width = b0 < 0x80 ? 1 : (b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4))
+            let end = min(idx + width, buf.count)
+            ranges.append((idx, end))
+            idx = end
         }
 
         let initialCount = ranges.count
@@ -374,10 +381,27 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
 /// bytes -> token id. Open addressing with linear probing; lookups hash raw
 /// UTF-8 bytes (FNV-1a) instead of Swift String keys, so no String hashing
 /// (NFC walk), no NSString bridging, and no per-lookup allocation. Keys are
-/// verified with a full byte comparison, so results are exactly those of the
-/// String-keyed tables (NSString keys compare byte-exactly, as does this
-/// table — including any canonically-equal-but-differently-encoded keys that
-/// `BinaryDistinctString` admits).
+/// verified with a full byte comparison.
+///
+/// **The pair table's match semantics are byte-exact, which is a DELIBERATE
+/// narrowing of what it replaces.** `tokensToIds` is `[NSString: Int]`, and
+/// NSString compares UTF-16 code units, so `id(for:)` is exactly the old
+/// subscript. `bpeRanks` is `[BytePair: Int]` and `BytePair` holds Swift
+/// `String`s (see its declaration), so the dictionary probe it replaces
+/// compared under Unicode CANONICAL EQUIVALENCE: an NFD merge key would match
+/// NFC text and vice versa, and two normalization variants of one merge
+/// collapsed onto a single dictionary slot (last write wins). `rank(in:...)`
+/// matches bytes.
+///
+/// Byte-exact is the intended semantics — it is what `huggingface/tokenizers`
+/// and `tiktoken` do, the merge table is a byte-level artifact, and
+/// normalization is the normalizer's job, not the BPE inner loop's. It is
+/// unobservable for byte-level BPE vocabs (the GPT-2 byte->unicode map emits no
+/// combining marks, so no vocab key has a distinct normalization form), which
+/// is why the C24 gate saw 88/88 byte-identical items over 6.7M tokens on both
+/// PARO tokenizers. It CAN change output on a non-byte-level BPE vocab that
+/// carries mixed normalization forms — there, this is a fix, not a
+/// regression.
 private final class BytePairTables {
     private struct PairEntry {
         var hash: UInt64
