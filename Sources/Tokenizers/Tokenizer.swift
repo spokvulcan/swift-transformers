@@ -853,6 +853,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
                 context[key] = try Value(any: value)
             }
         }
+        // Render `tojson` the way `transformers` does (no escaped slashes,
+        // `ensure_ascii` off by default); see `ChatTemplateFilters.swift`.
+        context["tojson"] = .function(transformersToJSON)
 
         for (key, value) in tokenizerConfig.dictionary(or: [:]) {
             if specialTokenAttributes.contains(key.string), !value.isNull() {

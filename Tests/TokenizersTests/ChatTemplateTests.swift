@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Hub
 import Testing
 
 @testable import Tokenizers
@@ -403,5 +404,40 @@ struct ChatTemplateTests {
             messages: messages, chatTemplate: uniqueTemplate
         )
         #expect(result.count > 0)
+    }
+
+    /// `tojson` renders like `transformers` (`json.dumps(ensure_ascii=False)`):
+    /// slashes are never escaped and non-ASCII stays literal unless the
+    /// template passes `ensure_ascii=True`. swift-jinja's built-in produced
+    /// `<\/style>` and `\u2014`, so a tool call re-rendered from its parsed
+    /// arguments no longer matched the text the model emitted.
+    @Test("tojson renders slashes and non-ASCII the way transformers does")
+    func toJSONMatchesTransformers() async throws {
+        let bundle = Bundle.module
+        guard let tokenizerConfigURL = bundle.url(forResource: "tokenizer_config", withExtension: "json") else {
+            Issue.record("Missing offline tokenizer fixtures")
+            return
+        }
+        let configuration = LanguageModelConfigurationFromHub(modelFolder: tokenizerConfigURL.deletingLastPathComponent())
+        let tokenizer = try AutoTokenizer.from(
+            tokenizerConfig: try #require(try await configuration.tokenizerConfig),
+            tokenizerData: try await configuration.tokenizerData
+        )
+        let value: [String: any Sendable] = ["path": "</style> a/b \u{2014} c 🏳️", "z": 1]
+
+        let rendered = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal("{{ v | tojson }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": value]
+        )
+        #expect(rendered == #"{"path":"</style> a/b \#u{2014} c 🏳️","z":1}"#)
+
+        let ascii = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal("{{ v | tojson(ensure_ascii=True) }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": value]
+        )
+        #expect(ascii == #"{"path":"</style> a/b \u2014 c \ud83c\udff3\ufe0f","z":1}"#)
+
+        let indented = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal("{{ v | tojson(indent=2) }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": ["k": "/"]]
+        )
+        #expect(indented == "{\n  \"k\" : \"/\"\n}")
     }
 }
