@@ -7,6 +7,7 @@
 
 import Foundation
 import Hub
+import Jinja
 import Testing
 
 @testable import Tokenizers
@@ -406,38 +407,67 @@ struct ChatTemplateTests {
         #expect(result.count > 0)
     }
 
-    /// `tojson` renders like `transformers` (`json.dumps(ensure_ascii=False)`):
-    /// slashes are never escaped and non-ASCII stays literal unless the
-    /// template passes `ensure_ascii=True`. swift-jinja's built-in produced
-    /// `<\/style>` and `\u2014`, so a tool call re-rendered from its parsed
-    /// arguments no longer matched the text the model emitted.
-    @Test("tojson renders slashes and non-ASCII the way transformers does")
-    func toJSONMatchesTransformers() async throws {
-        let bundle = Bundle.module
-        guard let tokenizerConfigURL = bundle.url(forResource: "tokenizer_config", withExtension: "json") else {
-            Issue.record("Missing offline tokenizer fixtures")
-            return
-        }
+    private static func offlineTokenizer() async throws -> Tokenizer {
+        let tokenizerConfigURL = try #require(
+            Bundle.module.url(forResource: "tokenizer_config", withExtension: "json"), "Missing offline tokenizer fixtures"
+        )
         let configuration = LanguageModelConfigurationFromHub(modelFolder: tokenizerConfigURL.deletingLastPathComponent())
-        let tokenizer = try AutoTokenizer.from(
+        return try AutoTokenizer.from(
             tokenizerConfig: try #require(try await configuration.tokenizerConfig),
             tokenizerData: try await configuration.tokenizerData
         )
-        let value: [String: any Sendable] = ["path": "</style> a/b \u{2014} c 🏳️", "z": 1]
+    }
+
+    /// `tojson` renders like `transformers`, which defines it as
+    /// `json.dumps(x, ensure_ascii=False)`: `", "` and `": "` separators,
+    /// slashes never escaped, non-ASCII literal unless the template passes
+    /// `ensure_ascii=True`. Models are trained on that text, and a tool call
+    /// re-rendered from its parsed arguments should read as the model wrote it.
+    @Test("tojson renders the way transformers does")
+    func toJSONMatchesTransformers() async throws {
+        let tokenizer = try await Self.offlineTokenizer()
+        let value: [String: any Sendable] = ["path": "</style> a/b \u{2014} c 🏳️", "z": 1, "w": 2.0]
 
         let rendered = try tokenizer.renderChatTemplate(
             messages: [], chatTemplate: .literal("{{ v | tojson }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": value]
         )
-        #expect(rendered == #"{"path":"</style> a/b \#u{2014} c 🏳️","z":1}"#)
+        #expect(rendered == #"{"path": "</style> a/b \#u{2014} c 🏳️", "w": 2.0, "z": 1}"#)
 
         let ascii = try tokenizer.renderChatTemplate(
             messages: [], chatTemplate: .literal("{{ v | tojson(ensure_ascii=True) }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": value]
         )
-        #expect(ascii == #"{"path":"</style> a/b \u2014 c \ud83c\udff3\ufe0f","z":1}"#)
+        #expect(ascii == #"{"path": "</style> a/b \u2014 c \ud83c\udff3\ufe0f", "w": 2.0, "z": 1}"#)
 
         let indented = try tokenizer.renderChatTemplate(
-            messages: [], chatTemplate: .literal("{{ v | tojson(indent=2) }}"), addGenerationPrompt: false, tools: nil, additionalContext: ["v": ["k": "/"]]
+            messages: [], chatTemplate: .literal("{{ v | tojson(indent=2) }}"), addGenerationPrompt: false, tools: nil,
+            additionalContext: ["v": ["k": "/", "l": [1] as [any Sendable]] as [String: any Sendable]]
         )
-        #expect(indented == "{\n  \"k\" : \"/\"\n}")
+        #expect(indented == "{\n  \"k\": \"/\",\n  \"l\": [\n    1\n  ]\n}")
+    }
+
+    /// A Swift dictionary has no key order, so its keys render sorted, the
+    /// same text on every launch. A caller that kept the order Python would
+    /// see passes the tools as Jinja values through `additionalContext`,
+    /// which replaces the context's `tools`; `tools` still picks the template.
+    @Test("tools keep the key order of tools passed as Jinja values")
+    func toolsKeepTheKeyOrderOfJinjaValues() async throws {
+        let tokenizer = try await Self.offlineTokenizer()
+        let template = "{% for tool in tools %}{{ tool | tojson }}{% endfor %}"
+        let tool: [String: any Sendable] = [
+            "type": "function", "function": ["name": "f", "description": "d"] as [String: any Sendable],
+        ]
+
+        let sorted = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal(template), addGenerationPrompt: false, tools: [tool], additionalContext: nil
+        )
+        #expect(sorted == #"{"function": {"description": "d", "name": "f"}, "type": "function"}"#)
+
+        let ordered: Jinja.Value = .array([
+            .object(["type": .string("function"), "function": .object(["name": .string("f"), "description": .string("d")])])
+        ])
+        let kept = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal(template), addGenerationPrompt: false, tools: [tool], additionalContext: ["tools": ordered]
+        )
+        #expect(kept == #"{"type": "function", "function": {"name": "f", "description": "d"}}"#)
     }
 }

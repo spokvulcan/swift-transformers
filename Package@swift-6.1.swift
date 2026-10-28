@@ -23,7 +23,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.4.2"),
+        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.5.0"),
         // Work around SwiftPM trait resolution issue for transitive Xet dependency.
         .package(url: "https://github.com/huggingface/swift-xet.git", from: "0.2.0"),
         .package(
@@ -61,7 +61,7 @@ let package = Package(
         .testTarget(name: "GenerationTests", dependencies: ["Generation"]),
         .testTarget(name: "HubTests", dependencies: ["Hub", .product(name: "Jinja", package: "swift-jinja")], swiftSettings: swiftSettings),
         .testTarget(name: "ModelsTests", dependencies: ["Models", "Hub"], resources: [.process("Resources")]),
-        .testTarget(name: "TokenizersTests", dependencies: ["Tokenizers", "Models", "Hub"], resources: [.process("Resources")]),
+        .testTarget(name: "TokenizersTests", dependencies: ["Tokenizers", "Models", "Hub", .product(name: "Jinja", package: "swift-jinja")], resources: [.process("Resources")]),
     ],
     swiftLanguageModes: [.v5]
 )
